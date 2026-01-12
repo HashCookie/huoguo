@@ -97,7 +97,13 @@ async function showFinalStats() {
 
 // 优雅退出
 process.on('SIGINT', async () => {
-  console.log('\n\n👋 收到退出信号，正在停止采集服务...');
+  console.log('\n\n👋 收到退出信号 (SIGINT)，正在停止采集服务...');
+  await showFinalStats();
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  console.log('\n\n👋 收到终止信号 (SIGTERM)，正在停止采集服务...');
   await showFinalStats();
   process.exit(0);
 });

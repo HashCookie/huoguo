@@ -40,11 +40,13 @@ jobs:
           echo "✅ 采集完成 - $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
       
       - name: 配置 Git
+        if: always()
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
       
       - name: 提交数据文件
+        if: always()
         run: |
           git add data/snapshots/*.jsonl
           if git diff --staged --quiet; then
