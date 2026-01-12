@@ -1,0 +1,57 @@
+name: 朱富贵排队数据采集
+
+on:
+  # 每天北京时间 17:00 触发（UTC 09:00）
+  schedule:
+    - cron: '0 9 * * *'
+  
+  # 允许手动触发
+  workflow_dispatch:
+
+jobs:
+  collect-queue-data:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 10
+      
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+      
+      - name: 运行数据采集（5小时，17:00-22:00）
+        env:
+          MAX_RUNTIME_HOURS: 5
+        run: |
+          echo "🚀 开始采集数据 - $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
+          pnpm run collect
+          echo "✅ 采集完成 - $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
+      
+      - name: 配置 Git
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+      
+      - name: 提交数据文件
+        run: |
+          git add data/snapshots/*.jsonl
+          if git diff --staged --quiet; then
+            echo "📭 没有新数据需要提交"
+          else
+            TODAY=$(TZ=Asia/Shanghai date '+%Y-%m-%d')
+            git commit -m "🤖 自动采集: ${TODAY} 17:00-22:00 排队数据"
+            git push
+            echo "✅ 数据已提交到 GitHub"
+          fi
