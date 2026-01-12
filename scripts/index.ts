@@ -54,6 +54,18 @@ async function main() {
 
   // 设置定时任务：每 10 秒执行一次
   const cronJob = cron.schedule('*/10 * * * * *', async () => {
+    // 获取当前北京时间的小时数
+    const beijingTime = new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Shanghai"}));
+    const currentHour = beijingTime.getHours();
+    
+    // 如果到了晚上 10 点 (22:00)，自动停止
+    if (currentHour >= 22 || currentHour < 11) {
+      console.log(`\n⏰ 到达北京时间 ${beijingTime.toLocaleTimeString()}，已超过营业采集时段 (11:00-22:00)，自动停止...`);
+      cronJob.stop();
+      await showFinalStats();
+      process.exit(0);
+    }
+
     // 检查是否超过最大运行时长
     if (maxRuntimeHours > 0) {
       const runningHours = (Date.now() - startTime) / (1000 * 60 * 60);
