@@ -34,6 +34,8 @@ jobs:
       - name: 运行数据采集（5小时，17:00-22:00）
         env:
           MAX_RUNTIME_HOURS: 5
+          API_URL: ${{ secrets.API_URL }}
+          API_SECRET: ${{ secrets.API_SECRET }}
         run: |
           echo "🚀 开始采集数据 - $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
           pnpm run collect
