@@ -11,6 +11,8 @@ on:
 jobs:
   collect-queue-data:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     
     steps:
       - name: 检出代码
