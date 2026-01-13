@@ -11,12 +11,24 @@ const collector = new DataCollector();
 const localStorage = new DataStorage();
 const remoteStorage = new RemoteStorage();
 
+// 用于追踪上一次记录的排队人数，避免冗余写入 0 数据
+let lastTotalLineup: number | null = null;
+
 // 执行一次采集并保存
 async function runCollectionTask() {
   try {
     const snapshot = await collector.collect();
 
     if (snapshot) {
+      // 智能识别：如果当前无人排队，且上一次记录也是 0 人
+      // 则跳过写入，避免在非高峰时段或打烊后存入大量无效数据
+      if (snapshot.total_lineup === 0 && lastTotalLineup === 0) {
+        console.log('💤 当前无人排队（持续中），跳过数据库写入以节省空间');
+        return;
+      }
+
+      lastTotalLineup = snapshot.total_lineup;
+
       // 同时保存到本地和远程
       await Promise.allSettled([
         localStorage.saveSnapshot(snapshot),
