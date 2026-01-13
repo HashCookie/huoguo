@@ -1,6 +1,6 @@
 import cron from 'node-cron';
 import { DataCollector } from './collector';
-import { DataStorage } from './storage';
+import { DataStorage, RemoteStorage } from './storage';
 
 /**
  * 朱富贵火锅排队数据采集服务
@@ -8,7 +8,8 @@ import { DataStorage } from './storage';
  */
 
 const collector = new DataCollector();
-const storage = new DataStorage();
+const localStorage = new DataStorage();
+const remoteStorage = new RemoteStorage();
 
 // 执行一次采集并保存
 async function runCollectionTask() {
@@ -16,7 +17,11 @@ async function runCollectionTask() {
     const snapshot = await collector.collect();
 
     if (snapshot) {
-      await storage.saveSnapshot(snapshot);
+      // 同时保存到本地和远程
+      await Promise.allSettled([
+        localStorage.saveSnapshot(snapshot),
+        remoteStorage.saveSnapshot(snapshot)
+      ]);
     } else {
       console.warn('⚠️ 本次采集未获取到有效数据');
     }
@@ -37,11 +42,10 @@ async function main() {
   if (maxRuntimeHours > 0) {
     console.log(`⏲️  最大运行时长: ${maxRuntimeHours} 小时`);
   }
-  console.log('💾 数据保存路径:', storage['dataDir']);
   console.log('-----------------------------------\n');
 
   // 显示当前数据统计
-  const stats = storage.getStats();
+  const stats = localStorage.getStats();
   if (stats.totalFiles > 0) {
     console.log(`📊 现有数据统计:`);
     console.log(`   - 文件数量: ${stats.totalFiles}`);
@@ -86,7 +90,7 @@ async function main() {
 // 显示最终统计
 async function showFinalStats() {
   console.log('\n📊 最终数据统计:');
-  const stats = storage.getStats();
+  const stats = localStorage.getStats();
   console.log(`   - 文件数量: ${stats.totalFiles}`);
   console.log(`   - 总大小: ${(stats.totalSize / 1024).toFixed(2)} KB`);
   if (stats.dateRange) {
