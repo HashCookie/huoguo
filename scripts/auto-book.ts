@@ -294,107 +294,84 @@ async function main() {
 
   if (apis.length === 0) throw new Error('所有账号登录失败');
 
-  // 2. 计算每个账号的目标叫号时间
-  //    围绕吃饭时间均匀分布，间隔 10 分钟
-  //    例如 3 个账号，目标 19:30 → 19:20, 19:30, 19:40
-  const SPREAD_MINS = 10; // 每个账号间隔 10 分钟
-  const targets: Date[] = [];
-  for (let i = 0; i < apis.length; i++) {
-    const offset = (i - (apis.length - 1) / 2) * SPREAD_MINS;
-    targets.push(new Date(eatDate.getTime() + offset * 60000));
-  }
-
-  console.log(`\n[${now()}] 🎯 目标叫号时间:`);
-  for (let i = 0; i < apis.length; i++) {
-    const t = targets[i];
-    const bjTime = new Date(t.getTime() + 8 * 3600 * 1000);
-    const hh = String(bjTime.getUTCHours()).padStart(2, '0');
-    const mm = String(bjTime.getUTCMinutes()).padStart(2, '0');
-    console.log(`  ${apis[i].label}（${apis[i].account}）→ ${hh}:${mm}`);
-  }
-
-  // 3. 监控排队，在合适时机为每个账号取号
-  console.log(`\n[${now()}] ⏰ 开始监控排队，等待最佳取号时机...\n`);
+  // 2. 监控排队，等待最佳取号时机
+  const GAP = 3; // 每个号之间间隔约 3 桌
+  console.log(`\n[${now()}] ⏰ 开始监控排队，等待最佳取号时机...`);
+  console.log(`  策略: ${apis.length} 个账号，每个号间隔 ~${GAP} 桌\n`);
 
   const tickets: Ticket[] = [];
-  const takenSet = new Set<number>(); // 已取号的账号索引
 
-  while (takenSet.size < apis.length) {
+  while (true) {
     const status = await sampleAndUpdateRate();
+    const minsToEat = minutesUntil(eatDate);
+    const estimatedWaitMins = status.waitingCount / currentRate;
 
-    // 对每个未取号的账号，判断是否该取号了
-    for (let i = 0; i < apis.length; i++) {
-      if (takenSet.has(i)) continue;
+    console.log(
+      `[${now()}] 📊 等待=${status.waitingCount}桌 | ` +
+      `速度=${currentRate.toFixed(1)}桌/分钟 | ` +
+      `预计消化=${Math.round(estimatedWaitMins)}分钟 | ` +
+      `距吃饭=${Math.round(minsToEat)}分钟`
+    );
 
-      const minsToTarget = minutesUntil(targets[i]);
-
-      // 如果现在取号，前面有 waitingCount 桌，需要 waitingCount/rate 分钟消化
-      const estimatedWaitMins = status.waitingCount / currentRate;
-
-      // 时机：预计等待时间 ≈ 距目标叫号时间（留 5 桌余量）
-      const shouldTake = estimatedWaitMins <= minsToTarget + 5 / currentRate;
-
-      // 已经过了目标时间 → 放弃这个账号
-      if (minsToTarget <= 0) {
-        console.log(`[${now()}] ⏭️ ${apis[i].label} 目标时间已过，跳过`);
-        takenSet.add(i);
-        continue;
-      }
-
-      if (shouldTake) {
-        try {
-          console.log(`[${now()}] 🎫 ${apis[i].label} 时机到！取号中...`);
-          const result = await takeNumber(apis[i].api);
-          tickets.push({
-            label: apis[i].label,
-            account: apis[i].account,
-            api: apis[i].api,
-            ...result,
-            targetTime: targets[i],
-          });
-          console.log(`[${now()}]   ✅ ${apis[i].label} 取号成功: ${result.sn_text}`);
-          takenSet.add(i);
-        } catch (err: any) {
-          console.error(`[${now()}]   ❌ ${apis[i].label} 取号失败: ${err.message}`);
-          takenSet.add(i); // 失败也标记，避免反复重试
-        }
-      }
-    }
-
-    if (takenSet.size < apis.length) {
-      // 打印当前状态
-      const minsToEat = minutesUntil(eatDate);
-      console.log(
-        `[${now()}] 📊 等待=${status.waitingCount}桌 | ` +
-        `速度=${currentRate.toFixed(1)}桌/分钟 | ` +
-        `距吃饭=${Math.round(minsToEat)}分钟 | ` +
-        `已取号=${tickets.length}/${apis.length}`
+    // 排队太长，吃饭前排不到 → 放弃
+    if (minsToEat <= 10 && estimatedWaitMins > minsToEat * 2) {
+      console.log(`[${now()}] 🚫 排队太长（预计 ${Math.round(estimatedWaitMins)} 分钟），放弃取号`);
+      await sendEmail(
+        `😮‍💨 排队太长，不建议去（${status.waitingCount}桌）`,
+        `<h2>朱富贵火锅 - 排队提醒</h2>
+         <p>你计划 <strong>${EAT_TIME}</strong> 吃到（${NUM}人），但当前排队 ${status.waitingCount} 桌，预计需 ${(estimatedWaitMins / 60).toFixed(1)} 小时。</p>
+         <p><strong>已放弃取号</strong>，建议改天再去。</p>`
       );
-
-      // 排队太长，所有账号都排不到 → 放弃
-      const estimatedAll = status.waitingCount / currentRate;
-      if (minsToEat <= 10 && estimatedAll > minsToEat * 2) {
-        console.log(`[${now()}] 🚫 排队太长（预计 ${Math.round(estimatedAll)} 分钟），放弃剩余账号`);
-        await sendEmail(
-          `😮‍💨 排队太长，不建议去（${status.waitingCount}桌）`,
-          `<h2>朱富贵火锅 - 排队提醒</h2>
-           <p>你计划 <strong>${EAT_TIME}</strong> 吃到（${NUM}人），但当前排队 ${status.waitingCount} 桌，预计需 ${(estimatedAll / 60).toFixed(1)} 小时。</p>
-           <p><strong>已放弃取号</strong>，建议改天再去。</p>`
-        );
-        return;
-      }
-
-      // 动态间隔
-      const interval =
-        currentRate >= 5 ? 30 * 1000 :
-        currentRate >= 2 ? 60 * 1000 :
-        minsToEat > 60  ? 5 * 60 * 1000 :
-                          2 * 60 * 1000;
-      await sleep(interval);
+      return;
     }
+
+    // 时机判断：预计等待 ≈ 距吃饭时间
+    if (estimatedWaitMins <= minsToEat + 5 / currentRate) {
+      console.log(`[${now()}] 🎯 时机到了！开始依次取号...`);
+      break;
+    }
+
+    // 吃饭时间快到了但还没到最佳时机 → 也直接取
+    if (minsToEat <= 5) {
+      console.log(`[${now()}] ⚡ 距吃饭仅 ${Math.round(minsToEat)} 分钟，立即取号`);
+      break;
+    }
+
+    // 动态间隔
+    const interval =
+      currentRate >= 5 ? 30 * 1000 :
+      currentRate >= 2 ? 60 * 1000 :
+      minsToEat > 60  ? 5 * 60 * 1000 :
+                        2 * 60 * 1000;
+    await sleep(interval);
 
     if (Date.now() - startTime > MAX_RUNTIME_MS) {
       throw new Error('已达最大运行时间，自动退出');
+    }
+  }
+
+  // 3. 依次取号，每个号之间等待 GAP 桌的间隔
+  for (let i = 0; i < apis.length; i++) {
+    // 第 2 个号开始，等待间隔
+    if (i > 0) {
+      const waitSec = Math.round((GAP / currentRate) * 60);
+      console.log(`[${now()}]   等待 ~${waitSec}秒（约 ${GAP} 桌间隔）...`);
+      await sleep(waitSec * 1000);
+    }
+
+    try {
+      console.log(`[${now()}] 🎫 ${apis[i].label}（${apis[i].account}）取号中...`);
+      const result = await takeNumber(apis[i].api);
+      tickets.push({
+        label: apis[i].label,
+        account: apis[i].account,
+        api: apis[i].api,
+        ...result,
+        targetTime: eatDate,
+      });
+      console.log(`[${now()}]   ✅ 取号成功: ${result.sn_text}`);
+    } catch (err: any) {
+      console.error(`[${now()}]   ❌ ${apis[i].label} 取号失败: ${err.message}`);
     }
   }
 
