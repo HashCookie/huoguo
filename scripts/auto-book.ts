@@ -149,32 +149,30 @@ async function fetchQueueStatus(): Promise<QueueStatus> {
   };
 }
 
-// ─── 估算排队消化速度 ──────────────────────────────────────
-/** 通过两次采样估算每分钟消化几桌 */
-async function estimateRate(): Promise<number> {
-  console.log(`[${now()}] 📈 开始估算排队消化速度...`);
+// ─── 持续估算排队消化速度 ────────────────────────────────────
+let lastSample: QueueStatus | null = null;
+let currentRate = 0.5; // 默认 0.5 桌/分钟
 
-  const sample1 = await fetchQueueStatus();
-  console.log(`[${now()}]   第1次采样: 当前叫号=${sample1.currentSn}, 等待=${sample1.waitingCount}桌`);
+/** 采样一次并更新消化速度，返回当前状态 */
+async function sampleAndUpdateRate(): Promise<QueueStatus> {
+  const sample = await fetchQueueStatus();
 
-  // 等 5 分钟再采样
-  await sleep(5 * 60 * 1000);
+  if (lastSample) {
+    const elapsed = (sample.timestamp - lastSample.timestamp) / 60000;
+    const consumed = sample.currentSn - lastSample.currentSn;
 
-  const sample2 = await fetchQueueStatus();
-  console.log(`[${now()}]   第2次采样: 当前叫号=${sample2.currentSn}, 等待=${sample2.waitingCount}桌`);
-
-  const elapsed = (sample2.timestamp - sample1.timestamp) / 60000;
-  const consumed = sample2.currentSn - sample1.currentSn;
-
-  if (consumed <= 0 || elapsed <= 0) {
-    // 没有消化或数据异常，用默认值：每分钟 0.5 桌（即每桌 2 分钟）
-    console.log(`[${now()}]   无法估算速度，使用默认值: 0.5 桌/分钟`);
-    return 0.5;
+    if (consumed > 0 && elapsed > 0) {
+      const newRate = consumed / elapsed;
+      // 加权平均：70% 新数据 + 30% 旧数据，避免单次波动
+      currentRate = lastSample === null ? newRate : newRate * 0.7 + currentRate * 0.3;
+      console.log(
+        `[${now()}]   速度更新: ${currentRate.toFixed(2)} 桌/分钟（${elapsed.toFixed(1)}分钟消化${consumed}桌）`
+      );
+    }
   }
 
-  const rate = consumed / elapsed;
-  console.log(`[${now()}]   消化速度: ${rate.toFixed(2)} 桌/分钟（${elapsed.toFixed(0)}分钟内消化了${consumed}桌）`);
-  return rate;
+  lastSample = sample;
+  return sample;
 }
 
 // ─── 取号 ───────────────────────────────────────────────────
@@ -349,11 +347,15 @@ async function main() {
   // 1. 登录
   const api = await login();
 
-  // 2. 估算排队消化速度
-  const rate = await estimateRate(); // 桌/分钟
+  // 2. 等待合适时机取号（边监控边估算速度）
+  console.log(`\n[${now()}] ⏰ 开始监控排队，寻找最佳取号时机...\n`);
 
-  // 3. 等待合适时机取号
-  console.log(`\n[${now()}] ⏰ 等待最佳取号时机...\n`);
+  // 先采样一次作为基准
+  const firstSample = await sampleAndUpdateRate();
+  console.log(`[${now()}] 📊 首次采样: 当前叫号=${firstSample.currentSn}, 等待=${firstSample.waitingCount}桌`);
+
+  // 等 1 分钟拿第二个样本，快速得到初始速度
+  await sleep(60 * 1000);
 
   let booked = false;
   let booking: BookResult | null = null;
@@ -362,8 +364,8 @@ async function main() {
     const minsLeft = minutesUntilArrival(arrivalDate);
 
     try {
-      const status = await fetchQueueStatus();
-      const estimatedWaitMins = status.waitingCount / rate;
+      const status = await sampleAndUpdateRate();
+      const estimatedWaitMins = status.waitingCount / currentRate;
 
       console.log(
         `[${now()}] 📊 当前等待=${status.waitingCount}桌 | ` +
@@ -372,9 +374,7 @@ async function main() {
       );
 
       // 判断：到店前能不能轮到？
-      // 如果现在取号，前面 waitingCount 桌，需要 estimatedWaitMins 分钟
-      // 但你只有 minsLeft 分钟就到了
-      if (estimatedWaitMins <= minsLeft + AHEAD_BUFFER / rate) {
+      if (estimatedWaitMins <= minsLeft + AHEAD_BUFFER / currentRate) {
         console.log(`[${now()}] 🎯 时机到了！现在取号，预计到店时差不多轮到`);
         booked = true;
         break;
@@ -398,7 +398,12 @@ async function main() {
       }
     }
 
-    const checkInterval = minsLeft > 60 ? 5 * 60 * 1000 : 2 * 60 * 1000;
+    // 动态间隔：速度快查得频，速度慢查得松
+    const checkInterval =
+      currentRate >= 5 ? 30 * 1000 :    // ≥5桌/分钟 → 每30秒
+      currentRate >= 2 ? 60 * 1000 :    // ≥2桌/分钟 → 每1分钟
+      minsLeft > 60   ? 5 * 60 * 1000 : // 离到店远 → 每5分钟
+                        2 * 60 * 1000;   // 默认每2分钟
     await sleep(checkInterval);
 
     if (Date.now() - startTime > MAX_RUNTIME_MS) {
