@@ -325,13 +325,20 @@ async function main() {
       return;
     }
 
-    // 时机判断：预计等待 ≈ 距吃饭时间
-    if (estimatedWaitMins <= minsToEat + 5 / currentRate) {
-      console.log(`[${now()}] 🎯 时机到了！开始依次取号...`);
+    // 时机判断：预计等待 ≈ 距吃饭时间（双向匹配，不能太早也不能太晚）
+    // 允许误差：±5 分钟
+    const diff = Math.abs(estimatedWaitMins - minsToEat);
+    if (diff <= 5) {
+      console.log(`[${now()}] 🎯 时机到了！预计等待=${Math.round(estimatedWaitMins)}分钟 ≈ 距吃饭=${Math.round(minsToEat)}分钟`);
       break;
     }
 
-    // 吃饭时间快到了但还没到最佳时机 → 也直接取
+    // 排队很短但离吃饭还远 → 继续等
+    if (estimatedWaitMins < minsToEat - 5) {
+      console.log(`[${now()}]   ⏳ 取号太早（${Math.round(estimatedWaitMins)}分钟后就到号，但吃饭在${Math.round(minsToEat)}分钟后），继续等`);
+    }
+
+    // 吃饭时间快到了但排队仍较长 → 也取号（至少排上）
     if (minsToEat <= 5) {
       console.log(`[${now()}] ⚡ 距吃饭仅 ${Math.round(minsToEat)} 分钟，立即取号`);
       break;
