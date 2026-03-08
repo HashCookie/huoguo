@@ -290,6 +290,41 @@ async function sendNotification(progress: QueueProgress) {
   console.log(`[${now()}] 📧 通知邮件已发送至 ${NOTIFY_EMAIL}`);
 }
 
+async function sendQueueTooLongNotification(waitingCount: number, estimatedMins: number) {
+  if (!NOTIFY_EMAIL || !SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
+    console.log(`[${now()}] ⚠️ 邮件配置不完整，跳过通知`);
+    return;
+  }
+
+  const transporter = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_PORT === 465,
+    auth: { user: SMTP_USER, pass: SMTP_PASS },
+  });
+
+  const waitHours = (estimatedMins / 60).toFixed(1);
+
+  await transporter.sendMail({
+    from: `"朱富贵取号助手" <${SMTP_USER}>`,
+    to: NOTIFY_EMAIL,
+    subject: `😮‍💨 今天排队太长，不建议去（${waitingCount}桌，约${waitHours}小时）`,
+    html: `
+      <h2>朱富贵火锅 - 排队提醒</h2>
+      <p>你计划 <strong>${ARRIVAL_TIME}</strong> 到店（${NUM}人），但当前排队情况不乐观：</p>
+      <table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse;">
+        <tr><td><strong>当前等待</strong></td><td>${waitingCount} 桌</td></tr>
+        <tr><td><strong>预计排队时间</strong></td><td>约 ${waitHours} 小时</td></tr>
+        <tr><td><strong>查询时间</strong></td><td>${now()}</td></tr>
+      </table>
+      <p><strong>已放弃取号</strong>，建议改天或换个时间段再去。</p>
+      <p style="color:#888;margin-top:16px;">此邮件由自动取号系统发送</p>
+    `,
+  });
+
+  console.log(`[${now()}] 📧 "排队太长"通知已发送至 ${NOTIFY_EMAIL}`);
+}
+
 // ─── 主流程 ─────────────────────────────────────────────────
 async function main() {
   const arrivalDate = parseArrivalTime(ARRIVAL_TIME);
@@ -318,24 +353,16 @@ async function main() {
   const rate = await estimateRate(); // 桌/分钟
 
   // 3. 等待合适时机取号
-  // 思路：取号后前面会有 N 桌，消化 N 桌需要 N/rate 分钟
-  // 我们希望 N/rate ≈ 到店剩余分钟 - buffer
-  // 所以当"当前等待桌数/rate ≈ 到店剩余分钟"时取号
   console.log(`\n[${now()}] ⏰ 等待最佳取号时机...\n`);
+
+  let booked = false;
+  let booking: BookResult | null = null;
 
   while (true) {
     const minsLeft = minutesUntilArrival(arrivalDate);
 
-    if (minsLeft <= 10) {
-      // 离到店不到 10 分钟了，立即取号
-      console.log(`[${now()}] ⚡ 距到店仅 ${Math.round(minsLeft)} 分钟，立即取号！`);
-      break;
-    }
-
     try {
       const status = await fetchQueueStatus();
-      // 如果现在取号，前面大约有 waitingCount 桌
-      // 消化这些桌需要 waitingCount / rate 分钟
       const estimatedWaitMins = status.waitingCount / rate;
 
       console.log(
@@ -344,16 +371,33 @@ async function main() {
         `距到店=${Math.round(minsLeft)}分钟`
       );
 
-      // 如果现在取号，预计等待时间 ≈ 到店时间（留 AHEAD_BUFFER 桌余量）
+      // 判断：到店前能不能轮到？
+      // 如果现在取号，前面 waitingCount 桌，需要 estimatedWaitMins 分钟
+      // 但你只有 minsLeft 分钟就到了
       if (estimatedWaitMins <= minsLeft + AHEAD_BUFFER / rate) {
         console.log(`[${now()}] 🎯 时机到了！现在取号，预计到店时差不多轮到`);
+        booked = true;
         break;
+      }
+
+      // 快到店了但排队还是太长 → 放弃，不取号
+      if (minsLeft <= 10) {
+        const waitHours = (estimatedWaitMins / 60).toFixed(1);
+        console.log(`[${now()}] ❌ 距到店仅 ${Math.round(minsLeft)} 分钟，但前面还有 ${status.waitingCount} 桌（预计需 ${waitHours} 小时）`);
+        console.log(`[${now()}] 🚫 排队太长，到店前轮不到，放弃取号`);
+        await sendQueueTooLongNotification(status.waitingCount, estimatedWaitMins);
+        return;
       }
     } catch (err: any) {
       console.error(`[${now()}] ❌ 查询失败: ${err.message}`);
+
+      // 查询失败 + 快到店了，也不盲目取号
+      if (minsLeft <= 10) {
+        console.log(`[${now()}] 🚫 无法判断排队情况，放弃取号`);
+        return;
+      }
     }
 
-    // 根据离到店时间动态调整查询间隔
     const checkInterval = minsLeft > 60 ? 5 * 60 * 1000 : 2 * 60 * 1000;
     await sleep(checkInterval);
 
@@ -362,8 +406,8 @@ async function main() {
     }
   }
 
-  // 4. 取号
-  const booking = await takeNumberWithRetry(api);
+  // 4. 取号（只有判断排得到才会到这里）
+  booking = await takeNumberWithRetry(api);
 
   // 5. 轮询排队进度
   console.log(`\n[${now()}] 📊 开始轮询排队进度（每 2 分钟一次）...\n`);
