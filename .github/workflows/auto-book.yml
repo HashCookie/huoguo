@@ -1,13 +1,13 @@
 name: 朱富贵自动取号
 
 on:
-  # 每天北京时间 16:50 触发（UTC 08:50）
-  schedule:
-    - cron: '50 8 * * *'
-
-  # 手动触发，可选择人数和门店
+  # 去掉定时，完全手动触发
   workflow_dispatch:
     inputs:
+      arrival_time:
+        description: '预计到店时间（如 18:30）'
+        required: true
+        default: '18:00'
       num:
         description: '用餐人数'
         required: false
@@ -30,7 +30,7 @@ on:
 jobs:
   auto-book:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 360
 
     steps:
       - name: 检出代码
@@ -55,6 +55,7 @@ jobs:
           BOOK_PASSWORD: ${{ secrets.BOOK_PASSWORD }}
           BOOK_NUM: ${{ github.event.inputs.num || '2' }}
           BOOK_STORE_ID: ${{ github.event.inputs.store_id || '19' }}
+          BOOK_ARRIVAL: ${{ github.event.inputs.arrival_time || '18:00' }}
           NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -62,5 +63,5 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
         run: |
           echo "🚀 开始自动取号 - $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
-          echo "   人数: $BOOK_NUM | 门店: $BOOK_STORE_ID"
+          echo "   人数: $BOOK_NUM | 到店时间: $BOOK_ARRIVAL | 门店: $BOOK_STORE_ID"
           pnpm run auto-book
