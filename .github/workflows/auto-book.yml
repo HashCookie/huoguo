@@ -1,0 +1,66 @@
+name: 朱富贵自动取号
+
+on:
+  # 每天北京时间 16:50 触发（UTC 08:50）
+  schedule:
+    - cron: '50 8 * * *'
+
+  # 手动触发，可选择人数和门店
+  workflow_dispatch:
+    inputs:
+      num:
+        description: '用餐人数'
+        required: false
+        default: '2'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+          - '6'
+          - '7'
+          - '8'
+      store_id:
+        description: '门店 ID'
+        required: false
+        default: '19'
+
+jobs:
+  auto-book:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 10
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 自动取号
+        env:
+          BOOK_ACCOUNT: ${{ secrets.BOOK_ACCOUNT }}
+          BOOK_PASSWORD: ${{ secrets.BOOK_PASSWORD }}
+          BOOK_NUM: ${{ github.event.inputs.num || '2' }}
+          BOOK_STORE_ID: ${{ github.event.inputs.store_id || '19' }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+        run: |
+          echo "🚀 开始自动取号 - $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
+          echo "   人数: $BOOK_NUM | 门店: $BOOK_STORE_ID"
+          pnpm run auto-book
