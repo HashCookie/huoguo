@@ -2,11 +2,12 @@ import axios, { AxiosInstance } from 'axios';
 import nodemailer from 'nodemailer';
 
 // ─── 环境变量 ───────────────────────────────────────────────
-const ACCOUNT = process.env.BOOK_ACCOUNT!;
-const PASSWORD = process.env.BOOK_PASSWORD!;
+const ACCOUNTS: { account: string; password: string }[] = JSON.parse(
+  process.env.BOOK_ACCOUNTS ?? '[]'
+);
 const NUM = Number(process.env.BOOK_NUM ?? '2');
 const STORE_ID = Number(process.env.BOOK_STORE_ID ?? '19');
-const ARRIVAL_TIME = process.env.BOOK_ARRIVAL ?? '18:00'; // 预计到店时间，如 "18:30"
+const EAT_TIME = process.env.BOOK_EAT_TIME ?? '19:30'; // 想吃到的时间
 const NOTIFY_EMAIL = process.env.NOTIFY_EMAIL;
 const SMTP_HOST = process.env.SMTP_HOST;
 const SMTP_PORT = Number(process.env.SMTP_PORT ?? '465');
@@ -14,10 +15,16 @@ const SMTP_USER = process.env.SMTP_USER;
 const SMTP_PASS = process.env.SMTP_PASS;
 
 const BASE_URL = 'https://xcx.zhufuguihuoguo.com';
-const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 分钟
-const MAX_RUNTIME_MS = 5 * 60 * 60 * 1000; // 5 小时
-const NOTIFY_THRESHOLD = 20; // 前面 ≤20 桌时通知
-const AHEAD_BUFFER = 5; // 提前 5 桌的余量，确保到了不会过号
+const MAX_RUNTIME_MS = 5 * 60 * 60 * 1000;
+
+// 历史数据：各时段消化速度（桌/分钟）
+const HISTORICAL_RATES: Record<number, number> = {
+  17: 8.9,
+  18: 8.8,
+  19: 10.2,
+  20: 18.3,
+  21: 30.8,
+};
 
 // ─── 工具函数 ───────────────────────────────────────────────
 function now() {
@@ -28,43 +35,44 @@ function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-/** 解析 "18:30" → 今天北京时间的 Date 对象 */
-function parseArrivalTime(timeStr: string): Date {
+/** 获取北京时间当前小时 */
+function bjHour(): number {
+  return new Date(Date.now() + 8 * 3600 * 1000).getUTCHours();
+}
+
+/** 获取当前时段的历史消化速度 */
+function getHistoricalRate(): number {
+  return HISTORICAL_RATES[bjHour()] ?? 10;
+}
+
+/** 解析 "19:30" → 今天北京时间的 Date 对象 */
+function parseTime(timeStr: string): Date {
   const [h, m] = timeStr.split(':').map(Number);
-  // 用 UTC+8 构造今天的目标时间
-  const nowDate = new Date();
-  const bjNow = new Date(nowDate.getTime() + 8 * 3600 * 1000);
+  const bjNow = new Date(Date.now() + 8 * 3600 * 1000);
   const bjTarget = new Date(bjNow);
   bjTarget.setUTCHours(h, m, 0, 0);
-  // 转回 UTC
   return new Date(bjTarget.getTime() - 8 * 3600 * 1000);
 }
 
-/** 返回距离到店还有多少分钟 */
-function minutesUntilArrival(arrivalDate: Date): number {
-  return Math.max(0, (arrivalDate.getTime() - Date.now()) / 60000);
+function minutesUntil(date: Date): number {
+  return (date.getTime() - Date.now()) / 60000;
 }
 
 // ─── 登录 ───────────────────────────────────────────────────
-async function login(): Promise<AxiosInstance> {
-  console.log(`[${now()}] 🔐 开始登录...`);
+const UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36';
 
-  const ua =
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36';
-
+async function login(account: string, password: string): Promise<AxiosInstance> {
   const loginPageRes = await axios.get(`${BASE_URL}/index/user/login.html`, {
-    headers: { 'User-Agent': ua },
+    headers: { 'User-Agent': UA },
     timeout: 15000,
   });
 
-  const csrfMatch = String(loginPageRes.data).match(
-    /name="__token__"\s+value="([^"]+)"/
-  );
-  if (!csrfMatch?.[1]) {
-    const altMatch = String(loginPageRes.data).match(/__token__.*?value="([^"]+)"/);
-    if (!altMatch?.[1]) throw new Error('无法获取 CSRF token');
-  }
-  const csrfToken = csrfMatch?.[1] ?? String(loginPageRes.data).match(/__token__.*?value="([^"]+)"/)?.[1]!;
+  const html = String(loginPageRes.data);
+  const csrfMatch =
+    html.match(/name="__token__"\s+value="([^"]+)"/) ??
+    html.match(/__token__.*?value="([^"]+)"/);
+  if (!csrfMatch?.[1]) throw new Error(`账号 ${account}: 无法获取 CSRF token`);
 
   const cookies: string[] = [];
   if (loginPageRes.headers['set-cookie']) {
@@ -74,14 +82,14 @@ async function login(): Promise<AxiosInstance> {
   const loginRes = await axios.post(
     `${BASE_URL}/index/user/login.html`,
     new URLSearchParams({
-      account: ACCOUNT,
-      password: PASSWORD,
+      account,
+      password,
       keeplogin: '1',
-      __token__: csrfToken,
+      __token__: csrfMatch[1],
     }).toString(),
     {
       headers: {
-        'User-Agent': ua,
+        'User-Agent': UA,
         'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
         'X-Requested-With': 'XMLHttpRequest',
         Cookie: cookies.join('; '),
@@ -94,7 +102,7 @@ async function login(): Promise<AxiosInstance> {
   );
 
   if (loginRes.data.code !== 1) {
-    throw new Error(`登录失败: ${loginRes.data.msg ?? JSON.stringify(loginRes.data)}`);
+    throw new Error(`账号 ${account} 登录失败: ${loginRes.data.msg}`);
   }
 
   if (loginRes.headers['set-cookie']) {
@@ -102,21 +110,19 @@ async function login(): Promise<AxiosInstance> {
   }
 
   const token = cookies.find(c => c.startsWith('token='))?.split('=')[1];
-  if (!token) throw new Error('登录失败：未找到 token cookie');
-
-  console.log(`[${now()}] ✅ 登录成功，token: ${token.substring(0, 8)}...`);
+  if (!token) throw new Error(`账号 ${account}: 未找到 token`);
 
   return axios.create({
     baseURL: BASE_URL,
     timeout: 15000,
-    headers: { 'Content-Type': 'application/json', 'User-Agent': ua, token },
+    headers: { 'Content-Type': 'application/json', 'User-Agent': UA, token },
   });
 }
 
-// ─── 查询当前排队情况（公开接口，不需要取号） ──────────────
+// ─── 查询当前排队情况（公开接口） ──────────────────────────
 interface QueueStatus {
-  currentSn: number; // 当前叫到的号码数字
-  waitingCount: number; // 当前等待桌数
+  currentSn: number;
+  waitingCount: number;
   timestamp: number;
 }
 
@@ -127,14 +133,11 @@ async function fetchQueueStatus(): Promise<QueueStatus> {
     { headers: { 'Content-Type': 'application/json' }, timeout: 10000 }
   );
 
-  if (res.data.code !== 1) {
-    throw new Error(`查询排队失败: ${res.data.msg}`);
-  }
+  if (res.data.code !== 1) throw new Error(`查询排队失败: ${res.data.msg}`);
 
   const store = res.data.data.find((s: any) => s.id === STORE_ID);
   if (!store) throw new Error('未找到目标门店');
 
-  // 根据人数找到对应桌型
   const tableType = store.all_lineup?.find((q: any) => {
     if (NUM <= 2) return q.type === 'A';
     if (NUM <= 4) return q.type === 'B';
@@ -149,11 +152,10 @@ async function fetchQueueStatus(): Promise<QueueStatus> {
   };
 }
 
-// ─── 持续估算排队消化速度 ────────────────────────────────────
+// ─── 实时速度追踪 ──────────────────────────────────────────
 let lastSample: QueueStatus | null = null;
-let currentRate = 0.5; // 默认 0.5 桌/分钟
+let currentRate = getHistoricalRate(); // 用历史数据作为初始值
 
-/** 采样一次并更新消化速度，返回当前状态 */
 async function sampleAndUpdateRate(): Promise<QueueStatus> {
   const sample = await fetchQueueStatus();
 
@@ -161,13 +163,9 @@ async function sampleAndUpdateRate(): Promise<QueueStatus> {
     const elapsed = (sample.timestamp - lastSample.timestamp) / 60000;
     const consumed = sample.currentSn - lastSample.currentSn;
 
-    if (consumed > 0 && elapsed > 0) {
+    if (consumed > 0 && elapsed > 0.5) {
       const newRate = consumed / elapsed;
-      // 加权平均：70% 新数据 + 30% 旧数据，避免单次波动
-      currentRate = lastSample === null ? newRate : newRate * 0.7 + currentRate * 0.3;
-      console.log(
-        `[${now()}]   速度更新: ${currentRate.toFixed(2)} 桌/分钟（${elapsed.toFixed(1)}分钟消化${consumed}桌）`
-      );
+      currentRate = newRate * 0.7 + currentRate * 0.3;
     }
   }
 
@@ -175,16 +173,18 @@ async function sampleAndUpdateRate(): Promise<QueueStatus> {
   return sample;
 }
 
-// ─── 取号 ───────────────────────────────────────────────────
-interface BookResult {
-  sn_text: string;
-  sn: string;
+// ─── 取号 & 取消 ────────────────────────────────────────────
+interface Ticket {
+  label: string; // 如 "账号1"
+  account: string;
+  api: AxiosInstance;
+  sn_text: string; // 如 "B350"
+  sn: number;
   record_id: string;
+  targetTime: Date; // 目标叫号时间
 }
 
-async function takeNumber(api: AxiosInstance): Promise<BookResult> {
-  console.log(`[${now()}] 🎫 取号中（${NUM}人，门店=${STORE_ID}）...`);
-
+async function takeNumber(api: AxiosInstance): Promise<{ sn_text: string; sn: number; record_id: string }> {
   const res = await api.post('/addons/lineup/user/getsn', {
     item_id: STORE_ID,
     num: NUM,
@@ -195,31 +195,14 @@ async function takeNumber(api: AxiosInstance): Promise<BookResult> {
   }
 
   const data = res.data.data;
-  const snText = data.sn_text ?? `${data.prefixcode}${data.sn}`;
-  const recordId = String(data.id);
-
-  console.log(`[${now()}] ✅ 取号成功！号码: ${snText}，记录ID: ${recordId}`);
-  return { sn_text: snText, sn: data.sn, record_id: recordId };
+  return {
+    sn_text: data.sn_text ?? `${data.prefixcode}${data.sn}`,
+    sn: Number(data.sn),
+    record_id: String(data.id),
+  };
 }
 
-async function takeNumberWithRetry(api: AxiosInstance): Promise<BookResult> {
-  const maxRetryMs = 15 * 60 * 1000;
-  const retryInterval = 15 * 1000;
-  const deadline = Date.now() + maxRetryMs;
-
-  while (Date.now() < deadline) {
-    try {
-      return await takeNumber(api);
-    } catch (err: any) {
-      const remaining = Math.round((deadline - Date.now()) / 1000);
-      console.log(`[${now()}] ⏳ 取号未成功（${err.message}），剩余 ${remaining}s 继续重试...`);
-      await sleep(retryInterval);
-    }
-  }
-  throw new Error('取号超时：超过 15 分钟仍未取号成功');
-}
-
-// ─── 查询排队进度（已取号后） ────────────────────────────────
+// ─── 查询排队进度 ───────────────────────────────────────────
 interface QueueProgress {
   sn: string;
   current_sn: string;
@@ -231,28 +214,24 @@ async function checkProgress(api: AxiosInstance, recordId: string): Promise<Queu
   const res = await api.post('/api/item/user_record', { record_id: recordId });
 
   if (res.data.code !== 1) {
-    throw new Error(`查询排队进度失败: ${res.data.msg ?? JSON.stringify(res.data)}`);
+    throw new Error(`查询失败: ${res.data.msg ?? JSON.stringify(res.data)}`);
   }
 
   const record = res.data.data?.user_record ?? res.data.data;
   const nowSn = record.now?.sn ? `${record.now.prefixcode ?? ''}${record.now.sn}` : '';
   const mySn = Number(record.sn) || 0;
-  const currentSn = Number(record.now?.sn) || 0;
-  const waitNum = mySn > currentSn ? mySn - currentSn : 0;
+  const curSn = Number(record.now?.sn) || 0;
 
   return {
     sn: record.sn_text ?? `${record.prefixcode ?? ''}${record.sn ?? ''}`,
     current_sn: nowSn,
-    wait_num: waitNum,
+    wait_num: mySn > curSn ? mySn - curSn : 0,
     status_text: record.status_text ?? '',
   };
 }
 
 // ─── 邮件通知 ───────────────────────────────────────────────
-let emailSent = false;
-
-async function sendNotification(progress: QueueProgress) {
-  if (emailSent) return;
+async function sendEmail(subject: string, html: string) {
   if (!NOTIFY_EMAIL || !SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
     console.log(`[${now()}] ⚠️ 邮件配置不完整，跳过通知`);
     return;
@@ -265,183 +244,234 @@ async function sendNotification(progress: QueueProgress) {
     auth: { user: SMTP_USER, pass: SMTP_PASS },
   });
 
-  const estimatedMinutes = progress.wait_num * 2;
-
   await transporter.sendMail({
     from: `"朱富贵取号助手" <${SMTP_USER}>`,
     to: NOTIFY_EMAIL,
-    subject: `🔥 快到你了！排队号 ${progress.sn}，前面还有 ${progress.wait_num} 桌`,
-    html: `
-      <h2>朱富贵火锅 - 排队通知</h2>
-      <table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse;">
-        <tr><td><strong>你的号码</strong></td><td>${progress.sn}</td></tr>
-        <tr><td><strong>当前叫到</strong></td><td>${progress.current_sn}</td></tr>
-        <tr><td><strong>前面还有</strong></td><td>${progress.wait_num} 桌</td></tr>
-        <tr><td><strong>预计等待</strong></td><td>约 ${estimatedMinutes} 分钟</td></tr>
-        <tr><td><strong>查询时间</strong></td><td>${now()}</td></tr>
-      </table>
-      <p style="color:#888;margin-top:16px;">此邮件由自动取号系统发送</p>
-    `,
+    subject,
+    html,
   });
 
-  emailSent = true;
-  console.log(`[${now()}] 📧 通知邮件已发送至 ${NOTIFY_EMAIL}`);
-}
-
-async function sendQueueTooLongNotification(waitingCount: number, estimatedMins: number) {
-  if (!NOTIFY_EMAIL || !SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
-    console.log(`[${now()}] ⚠️ 邮件配置不完整，跳过通知`);
-    return;
-  }
-
-  const transporter = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_PORT === 465,
-    auth: { user: SMTP_USER, pass: SMTP_PASS },
-  });
-
-  const waitHours = (estimatedMins / 60).toFixed(1);
-
-  await transporter.sendMail({
-    from: `"朱富贵取号助手" <${SMTP_USER}>`,
-    to: NOTIFY_EMAIL,
-    subject: `😮‍💨 今天排队太长，不建议去（${waitingCount}桌，约${waitHours}小时）`,
-    html: `
-      <h2>朱富贵火锅 - 排队提醒</h2>
-      <p>你计划 <strong>${ARRIVAL_TIME}</strong> 到店（${NUM}人），但当前排队情况不乐观：</p>
-      <table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse;">
-        <tr><td><strong>当前等待</strong></td><td>${waitingCount} 桌</td></tr>
-        <tr><td><strong>预计排队时间</strong></td><td>约 ${waitHours} 小时</td></tr>
-        <tr><td><strong>查询时间</strong></td><td>${now()}</td></tr>
-      </table>
-      <p><strong>已放弃取号</strong>，建议改天或换个时间段再去。</p>
-      <p style="color:#888;margin-top:16px;">此邮件由自动取号系统发送</p>
-    `,
-  });
-
-  console.log(`[${now()}] 📧 "排队太长"通知已发送至 ${NOTIFY_EMAIL}`);
+  console.log(`[${now()}] 📧 邮件已发送至 ${NOTIFY_EMAIL}`);
 }
 
 // ─── 主流程 ─────────────────────────────────────────────────
 async function main() {
-  const arrivalDate = parseArrivalTime(ARRIVAL_TIME);
-  const minsUntil = minutesUntilArrival(arrivalDate);
+  const eatDate = parseTime(EAT_TIME);
+  const minsUntilEat = minutesUntil(eatDate);
+  const numAccounts = ACCOUNTS.length;
 
   console.log('='.repeat(50));
   console.log(`[${now()}] 🚀 朱富贵自动取号系统启动`);
   console.log(`  人数: ${NUM}  门店ID: ${STORE_ID}`);
-  console.log(`  预计到店: ${ARRIVAL_TIME}（${Math.round(minsUntil)} 分钟后）`);
+  console.log(`  想吃到的时间: ${EAT_TIME}（${Math.round(minsUntilEat)} 分钟后）`);
+  console.log(`  账号数量: ${numAccounts}`);
   console.log('='.repeat(50));
 
-  if (!ACCOUNT || !PASSWORD) {
-    throw new Error('缺少环境变量 BOOK_ACCOUNT 或 BOOK_PASSWORD');
+  if (numAccounts === 0) {
+    throw new Error('缺少 BOOK_ACCOUNTS 环境变量');
   }
 
-  if (minsUntil <= 0) {
-    throw new Error(`到店时间 ${ARRIVAL_TIME} 已过，请重新设置`);
+  if (minsUntilEat <= 0) {
+    throw new Error(`吃饭时间 ${EAT_TIME} 已过，请重新设置`);
   }
 
   const startTime = Date.now();
 
-  // 1. 登录
-  const api = await login();
-
-  // 2. 等待合适时机取号（边监控边估算速度）
-  console.log(`\n[${now()}] ⏰ 开始监控排队，寻找最佳取号时机...\n`);
-
-  // 先采样一次作为基准
-  const firstSample = await sampleAndUpdateRate();
-  console.log(`[${now()}] 📊 首次采样: 当前叫号=${firstSample.currentSn}, 等待=${firstSample.waitingCount}桌`);
-
-  // 等 1 分钟拿第二个样本，快速得到初始速度
-  await sleep(60 * 1000);
-
-  let booked = false;
-  let booking: BookResult | null = null;
-
-  while (true) {
-    const minsLeft = minutesUntilArrival(arrivalDate);
-
+  // 1. 登录所有账号
+  console.log(`\n[${now()}] 🔐 登录 ${numAccounts} 个账号...`);
+  const apis: { label: string; account: string; api: AxiosInstance }[] = [];
+  for (let i = 0; i < numAccounts; i++) {
+    const { account, password } = ACCOUNTS[i];
+    const masked = account.slice(0, 3) + '****' + account.slice(-4);
     try {
-      const status = await sampleAndUpdateRate();
+      const api = await login(account, password);
+      apis.push({ label: `账号${i + 1}`, account: masked, api });
+      console.log(`[${now()}]   ✅ ${masked} 登录成功`);
+    } catch (err: any) {
+      console.error(`[${now()}]   ❌ ${masked} 登录失败: ${err.message}`);
+    }
+  }
+
+  if (apis.length === 0) throw new Error('所有账号登录失败');
+
+  // 2. 计算每个账号的目标叫号时间
+  //    围绕吃饭时间均匀分布，间隔 10 分钟
+  //    例如 3 个账号，目标 19:30 → 19:20, 19:30, 19:40
+  const SPREAD_MINS = 10; // 每个账号间隔 10 分钟
+  const targets: Date[] = [];
+  for (let i = 0; i < apis.length; i++) {
+    const offset = (i - (apis.length - 1) / 2) * SPREAD_MINS;
+    targets.push(new Date(eatDate.getTime() + offset * 60000));
+  }
+
+  console.log(`\n[${now()}] 🎯 目标叫号时间:`);
+  for (let i = 0; i < apis.length; i++) {
+    const t = targets[i];
+    const bjTime = new Date(t.getTime() + 8 * 3600 * 1000);
+    const hh = String(bjTime.getUTCHours()).padStart(2, '0');
+    const mm = String(bjTime.getUTCMinutes()).padStart(2, '0');
+    console.log(`  ${apis[i].label}（${apis[i].account}）→ ${hh}:${mm}`);
+  }
+
+  // 3. 监控排队，在合适时机为每个账号取号
+  console.log(`\n[${now()}] ⏰ 开始监控排队，等待最佳取号时机...\n`);
+
+  const tickets: Ticket[] = [];
+  const takenSet = new Set<number>(); // 已取号的账号索引
+
+  while (takenSet.size < apis.length) {
+    const status = await sampleAndUpdateRate();
+
+    // 对每个未取号的账号，判断是否该取号了
+    for (let i = 0; i < apis.length; i++) {
+      if (takenSet.has(i)) continue;
+
+      const minsToTarget = minutesUntil(targets[i]);
+
+      // 如果现在取号，前面有 waitingCount 桌，需要 waitingCount/rate 分钟消化
       const estimatedWaitMins = status.waitingCount / currentRate;
 
-      console.log(
-        `[${now()}] 📊 当前等待=${status.waitingCount}桌 | ` +
-        `预计消化=${Math.round(estimatedWaitMins)}分钟 | ` +
-        `距到店=${Math.round(minsLeft)}分钟`
-      );
+      // 时机：预计等待时间 ≈ 距目标叫号时间（留 5 桌余量）
+      const shouldTake = estimatedWaitMins <= minsToTarget + 5 / currentRate;
 
-      // 判断：到店前能不能轮到？
-      if (estimatedWaitMins <= minsLeft + AHEAD_BUFFER / currentRate) {
-        console.log(`[${now()}] 🎯 时机到了！现在取号，预计到店时差不多轮到`);
-        booked = true;
-        break;
+      // 已经过了目标时间 → 放弃这个账号
+      if (minsToTarget <= 0) {
+        console.log(`[${now()}] ⏭️ ${apis[i].label} 目标时间已过，跳过`);
+        takenSet.add(i);
+        continue;
       }
 
-      // 快到店了但排队还是太长 → 放弃，不取号
-      if (minsLeft <= 10) {
-        const waitHours = (estimatedWaitMins / 60).toFixed(1);
-        console.log(`[${now()}] ❌ 距到店仅 ${Math.round(minsLeft)} 分钟，但前面还有 ${status.waitingCount} 桌（预计需 ${waitHours} 小时）`);
-        console.log(`[${now()}] 🚫 排队太长，到店前轮不到，放弃取号`);
-        await sendQueueTooLongNotification(status.waitingCount, estimatedWaitMins);
-        return;
-      }
-    } catch (err: any) {
-      console.error(`[${now()}] ❌ 查询失败: ${err.message}`);
-
-      // 查询失败 + 快到店了，也不盲目取号
-      if (minsLeft <= 10) {
-        console.log(`[${now()}] 🚫 无法判断排队情况，放弃取号`);
-        return;
+      if (shouldTake) {
+        try {
+          console.log(`[${now()}] 🎫 ${apis[i].label} 时机到！取号中...`);
+          const result = await takeNumber(apis[i].api);
+          tickets.push({
+            label: apis[i].label,
+            account: apis[i].account,
+            api: apis[i].api,
+            ...result,
+            targetTime: targets[i],
+          });
+          console.log(`[${now()}]   ✅ ${apis[i].label} 取号成功: ${result.sn_text}`);
+          takenSet.add(i);
+        } catch (err: any) {
+          console.error(`[${now()}]   ❌ ${apis[i].label} 取号失败: ${err.message}`);
+          takenSet.add(i); // 失败也标记，避免反复重试
+        }
       }
     }
 
-    // 动态间隔：速度快查得频，速度慢查得松
-    const checkInterval =
-      currentRate >= 5 ? 30 * 1000 :    // ≥5桌/分钟 → 每30秒
-      currentRate >= 2 ? 60 * 1000 :    // ≥2桌/分钟 → 每1分钟
-      minsLeft > 60   ? 5 * 60 * 1000 : // 离到店远 → 每5分钟
-                        2 * 60 * 1000;   // 默认每2分钟
-    await sleep(checkInterval);
+    if (takenSet.size < apis.length) {
+      // 打印当前状态
+      const minsToEat = minutesUntil(eatDate);
+      console.log(
+        `[${now()}] 📊 等待=${status.waitingCount}桌 | ` +
+        `速度=${currentRate.toFixed(1)}桌/分钟 | ` +
+        `距吃饭=${Math.round(minsToEat)}分钟 | ` +
+        `已取号=${tickets.length}/${apis.length}`
+      );
+
+      // 排队太长，所有账号都排不到 → 放弃
+      const estimatedAll = status.waitingCount / currentRate;
+      if (minsToEat <= 10 && estimatedAll > minsToEat * 2) {
+        console.log(`[${now()}] 🚫 排队太长（预计 ${Math.round(estimatedAll)} 分钟），放弃剩余账号`);
+        await sendEmail(
+          `😮‍💨 排队太长，不建议去（${status.waitingCount}桌）`,
+          `<h2>朱富贵火锅 - 排队提醒</h2>
+           <p>你计划 <strong>${EAT_TIME}</strong> 吃到（${NUM}人），但当前排队 ${status.waitingCount} 桌，预计需 ${(estimatedAll / 60).toFixed(1)} 小时。</p>
+           <p><strong>已放弃取号</strong>，建议改天再去。</p>`
+        );
+        return;
+      }
+
+      // 动态间隔
+      const interval =
+        currentRate >= 5 ? 30 * 1000 :
+        currentRate >= 2 ? 60 * 1000 :
+        minsToEat > 60  ? 5 * 60 * 1000 :
+                          2 * 60 * 1000;
+      await sleep(interval);
+    }
 
     if (Date.now() - startTime > MAX_RUNTIME_MS) {
       throw new Error('已达最大运行时间，自动退出');
     }
   }
 
-  // 4. 取号（只有判断排得到才会到这里）
-  booking = await takeNumberWithRetry(api);
-
-  // 5. 轮询排队进度
-  console.log(`\n[${now()}] 📊 开始轮询排队进度（每 2 分钟一次）...\n`);
-
-  while (Date.now() - startTime < MAX_RUNTIME_MS) {
-    try {
-      const progress = await checkProgress(api, booking.record_id);
-
-      console.log(
-        `[${now()}] 📋 号码=${progress.sn} | 当前叫号=${progress.current_sn} | 前面=${progress.wait_num}桌 | 状态=${progress.status_text}`
-      );
-
-      if (progress.status_text.includes('叫号') || progress.status_text.includes('过号')) {
-        console.log(`[${now()}] 🎉 状态变更: ${progress.status_text}，结束轮询`);
-        await sendNotification(progress);
-        return;
-      }
-
-      if (progress.wait_num <= NOTIFY_THRESHOLD) {
-        await sendNotification(progress);
-      }
-    } catch (err: any) {
-      console.error(`[${now()}] ❌ 查询失败: ${err.message}`);
-    }
-
-    await sleep(POLL_INTERVAL_MS);
+  if (tickets.length === 0) {
+    console.log(`[${now()}] ❌ 所有账号都未成功取号，退出`);
+    return;
   }
 
-  console.log(`[${now()}] ⏰ 已达到最大运行时间，自动退出`);
+  // 4. 汇总取号结果
+  console.log(`\n[${now()}] 📋 取号汇总:`);
+  for (const t of tickets) {
+    console.log(`  ${t.label}（${t.account}）: ${t.sn_text}`);
+  }
+
+  // 5. 轮询所有票的进度，找到最佳的那张
+  console.log(`\n[${now()}] 📊 开始轮询所有号码的进度...\n`);
+
+  let bestNotified = false;
+
+  while (Date.now() - startTime < MAX_RUNTIME_MS) {
+    let bestTicket: Ticket | null = null;
+    let bestWait = Infinity;
+
+    for (const ticket of tickets) {
+      try {
+        const progress = await checkProgress(ticket.api, ticket.record_id);
+        console.log(
+          `[${now()}]   ${ticket.label} ${progress.sn}: 当前叫号=${progress.current_sn} | 前面=${progress.wait_num}桌 | ${progress.status_text}`
+        );
+
+        // 已叫号 → 直接用这个
+        if (progress.status_text.includes('叫号')) {
+          console.log(`\n[${now()}] 🎉 ${ticket.label} (${progress.sn}) 已叫号！`);
+
+          await sendEmail(
+            `🔥 到你了！${progress.sn} 已叫号`,
+            `<h2>朱富贵火锅 - 叫号通知</h2>
+             <table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse;">
+               <tr><td><strong>你的号码</strong></td><td>${progress.sn}</td></tr>
+               <tr><td><strong>使用账号</strong></td><td>${ticket.account}</td></tr>
+               <tr><td><strong>叫号时间</strong></td><td>${now()}</td></tr>
+             </table>`
+          );
+          return;
+        }
+
+        if (progress.wait_num < bestWait) {
+          bestWait = progress.wait_num;
+          bestTicket = ticket;
+        }
+      } catch (err: any) {
+        console.error(`[${now()}]   ❌ ${ticket.label} 查询失败: ${err.message}`);
+      }
+    }
+
+    if (bestTicket && bestWait <= 20 && !bestNotified) {
+      bestNotified = true;
+      console.log(`\n[${now()}] 🏆 最佳号码: ${bestTicket.sn_text}（${bestTicket.label}），前面 ${bestWait} 桌`);
+
+      await sendEmail(
+        `🔥 快到了！${bestTicket.sn_text}（${bestTicket.label}），前面 ${bestWait} 桌`,
+        `<h2>朱富贵火锅 - 排队通知</h2>
+         <table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse;">
+           <tr><td><strong>最佳号码</strong></td><td>${bestTicket.sn_text}（${bestTicket.label} ${bestTicket.account}）</td></tr>
+           <tr><td><strong>前面还有</strong></td><td>${bestWait} 桌</td></tr>
+           <tr><td><strong>预计等待</strong></td><td>约 ${Math.round(bestWait / currentRate)} 分钟</td></tr>
+           <tr><td><strong>查询时间</strong></td><td>${now()}</td></tr>
+         </table>
+         <p>到店后请用 <strong>${bestTicket.account}</strong> 的号入座。</p>`
+      );
+    }
+
+    console.log('');
+    await sleep(2 * 60 * 1000);
+  }
+
+  console.log(`[${now()}] ⏰ 已达最大运行时间，自动退出`);
 }
 
 main().catch(err => {

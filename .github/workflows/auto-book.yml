@@ -1,13 +1,12 @@
 name: 朱富贵自动取号
 
 on:
-  # 去掉定时，完全手动触发
   workflow_dispatch:
     inputs:
-      arrival_time:
-        description: '预计到店时间（如 18:30）'
+      eat_time:
+        description: '想吃到的时间（如 19:30）'
         required: true
-        default: '18:00'
+        default: '19:30'
       num:
         description: '用餐人数'
         required: false
@@ -51,11 +50,10 @@ jobs:
 
       - name: 自动取号
         env:
-          BOOK_ACCOUNT: ${{ secrets.BOOK_ACCOUNT }}
-          BOOK_PASSWORD: ${{ secrets.BOOK_PASSWORD }}
+          BOOK_ACCOUNTS: ${{ secrets.BOOK_ACCOUNTS }}
           BOOK_NUM: ${{ github.event.inputs.num || '2' }}
           BOOK_STORE_ID: ${{ github.event.inputs.store_id || '19' }}
-          BOOK_ARRIVAL: ${{ github.event.inputs.arrival_time || '18:00' }}
+          BOOK_EAT_TIME: ${{ github.event.inputs.eat_time || '19:30' }}
           NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -63,5 +61,5 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
         run: |
           echo "🚀 开始自动取号 - $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
-          echo "   人数: $BOOK_NUM | 到店时间: $BOOK_ARRIVAL | 门店: $BOOK_STORE_ID"
+          echo "   人数: $BOOK_NUM | 吃饭时间: $BOOK_EAT_TIME | 门店: $BOOK_STORE_ID"
           pnpm run auto-book
